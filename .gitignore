@@ -1,0 +1,45 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Environment / config
+*.env
+
+# ---- OS / Editor ----
+.DS_Store
+Thumbs.db
+
+.vscode/
+.idea/
+*.iml
+
+# ---- Build / packaging ----
+build/
+dist/
+*.egg-info/
+*.egg
+
+# ---- Logs ----
+*.log
+
+# ---- Project-specific (big / generated stuff) ----
+# Datasets (local only)
+data/
+
+# Model weights & caches
+models/
+
+# Generated outputs
+outputs/
+output.txt
+pairs.txt
+results.csv
+*.csv
+*.npy
