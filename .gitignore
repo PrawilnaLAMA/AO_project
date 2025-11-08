@@ -43,3 +43,7 @@ pairs.txt
 results.csv
 *.csv
 *.npy
+
+imageDB/
+
+20180402-114759-vggface2.pt
