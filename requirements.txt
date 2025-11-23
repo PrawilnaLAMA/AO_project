@@ -1,12 +1,34 @@
-# Core dependencies
-torch==2.0.1
-torchvision==0.15.2
-torchaudio==2.0.2
+# ============================================================
+# AO_project - dependencies
+#
+# Jak zainstalować od zera (Windows + NVIDIA GPU):
+#
+#   1) Utwórz i aktywuj virtualenv:
+#        python -m venv .venv
+#        .venv\Scripts\activate
+#
+#   2) Zainstaluj wszystkie paczki (PyTorch z CUDA 12.1):
+#        python -m pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu121
+#
+#   UWAGA:
+#   - Ten plik zakłada instalację CUDA-buildów (2.4.1+cu121).
+#   - Bez parametru --index-url powyższe wersje mogą się nie zainstalować.
+#
+# Jeśli kiedyś będziesz chciał CPU-only, podmień wpisy torch/torchvision/torchaudio
+# na wersje bez "+cu121" (albo użyj oficjalnego "Get Started" z pytorch.org).
+# ============================================================
 
+# --- PyTorch (GPU, CUDA 12.1) ---
+torch==2.4.1+cu121
+torchvision==0.19.1+cu121
+torchaudio==2.4.1+cu121
+
+# --- FaceNet wrapper ---
 facenet-pytorch==2.5.3
 
+# --- Core scientific stack ---
 numpy>=1.24,<2.0
 Pillow>=10.0.0,<11.0
 
-# Optional but handy
+# --- Quality of life ---
 tqdm>=4.66.0

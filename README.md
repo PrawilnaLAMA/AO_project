@@ -1,4 +1,23 @@
+python -m venv .venv
+.\.venv\Scripts\activate
+python -m pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cu121
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # Face Embedding & Verification Project
+
+
 
 This project demonstrates how to:
 

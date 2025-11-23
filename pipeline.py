@@ -10,7 +10,7 @@ from facenet_pytorch import InceptionResnetV1
 import numpy as np
 from numpy.linalg import norm
 
-import directory_prep  # Twój plik z pytania
+import directory_prep  # pomocnicze funkcje pracy z katalogiem
 
 
 def setup_logger(log_level: str):
@@ -20,21 +20,24 @@ def setup_logger(log_level: str):
     )
 
 
-def check_cuda_devices():
-    logging.info("Checking CUDA devices:")
+def check_cuda_devices() -> bool:
+    """
+    Prosta diagnostyka CUDA. Zwraca True jeśli CUDA jest dostępna.
+    """
+    logging.info("Checking CUDA devices...")
     if not torch.cuda.is_available():
         logging.warning("CUDA is not available. Running on CPU only.")
         return False
 
     device_count = torch.cuda.device_count()
     logging.info(f"Found {device_count} CUDA device(s):")
-    
+
     for i in range(device_count):
         device = torch.cuda.get_device_properties(i)
         logging.info(f"  Device {i}: {device.name}")
         logging.info(f"    Total memory: {device.total_memory / 1024**2:.0f} MB")
         logging.info(f"    CUDA Capability: {device.major}.{device.minor}")
-    
+
     current_device = torch.cuda.current_device()
     logging.info(f"Current CUDA device: {current_device} ({torch.cuda.get_device_name(current_device)})")
     return True
@@ -47,6 +50,10 @@ def load_model(device: str, weights: str):
 
 
 def process_image(image_path: str):
+    """
+    Wczytuje obraz, zmienia rozmiar na 160x160 i zamienia na tensor [3,160,160] w zakresie [0,1].
+    Zwraca torch.Tensor lub None (gdy wystąpi błąd).
+    """
     try:
         img = Image.open(image_path).convert("RGB")
         img = img.resize((160, 160), Image.LANCZOS)
@@ -56,30 +63,63 @@ def process_image(image_path: str):
         logging.warning(f"Error processing {image_path}: {str(e)}")
         return None
 
+
 def get_embeddings_batch(image_paths: list, model, device: str):
+    """
+    Liczy embeddingi dla listy ścieżek obrazów.
+    Zwraca:
+        - embeddings: np.ndarray o kształcie [N, D]
+        - valid_indices: lista indeksów (w oryginalnej liście image_paths),
+          dla których udało się policzyć embedding.
+    """
     tensors = []
     valid_indices = []
-    
+
     for idx, path in enumerate(image_paths):
         tensor = process_image(path)
         if tensor is not None:
             tensors.append(tensor)
             valid_indices.append(idx)
-    
+
     if not tensors:
-        return [], []
-    
-    try:
-        # Stack all tensors into a batch
-        batch = torch.stack(tensors).to(device)
-        
-        with torch.no_grad():
-            embeddings = model(batch).cpu().numpy()
-        
-        return embeddings, valid_indices
-    except Exception as e:
-        logging.warning(f"Error processing batch: {str(e)}")
-        return [], []
+        logging.warning("No valid images in batch.")
+        return np.zeros((0, 512), dtype=np.float32), []
+
+    batch = torch.stack(tensors).to(device)
+
+    with torch.no_grad():
+        emb = model(batch).cpu().numpy()
+
+    return emb, valid_indices
+
+
+def compute_embeddings_for_all_images(image_paths: list, model, device: str, batch_size: int):
+    """
+    Zwraca słownik {ścieżka_obrazu: embedding}.
+    Obrazy są przetwarzane batchami, ale każdy obraz jest embedowany tylko raz.
+    """
+    embeddings_dict = {}
+    total = len(image_paths)
+    logging.info(f"Computing embeddings for {total} unique images...")
+
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch_paths = image_paths[start:end]
+
+        # używamy już istniejącej funkcji batchującej
+        batch_embeddings, valid_indices = get_embeddings_batch(batch_paths, model, device)
+
+        if not valid_indices:
+            logging.warning(f"Skipping batch {start // batch_size + 1} because all images failed")
+            continue
+
+        # valid_indices to indeksy w batch_paths, a batch_embeddings jest w tej samej kolejności
+        for out_idx, img_idx in enumerate(valid_indices):
+            img_path = batch_paths[img_idx]
+            embeddings_dict[img_path] = batch_embeddings[out_idx]
+
+    logging.info(f"Computed embeddings for {len(embeddings_dict)}/{total} images")
+    return embeddings_dict
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -100,7 +140,11 @@ def parse_args():
                         help="Path to CSV with comparison results.")
     parser.add_argument("--weights", default="vggface2",
                         choices=["vggface2", "casia-webface"])
-    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use: 'cpu' or 'cuda'"
+    )
     parser.add_argument("--log-level", default="INFO")
     parser.add_argument("--threshold", type=float, default=0.8,
                         help="Cosine threshold for same/different.")
@@ -113,12 +157,13 @@ def main():
     args = parse_args()
     setup_logger(args.log_level)
 
-    # Sprawdź dostępność CUDA przed rozpoczęciem
-    if args.device == "cuda":
-        has_cuda = check_cuda_devices()
-        if not has_cuda:
+    # Sprawdzenie/sprostowanie wyboru urządzenia
+    if args.device.startswith("cuda"):
+        if not check_cuda_devices():
             logging.warning("Forcing CPU usage due to CUDA unavailability")
             args.device = "cpu"
+    else:
+        logging.info(f"Using device: {args.device}")
 
     if not os.path.isdir(args.db_path):
         raise NotADirectoryError(f"{args.db_path} is not a directory")
@@ -136,59 +181,43 @@ def main():
     # 3. Załaduj model
     model = load_model(args.device, args.weights)
 
-    # 4. Porównaj wszystkie pary i zapisz do CSV
+    # 4. Wylicz embeddingi dla wszystkich unikalnych obrazów
+    all_images = sorted({img for img1, img2, _ in pairs for img in (img1, img2)})
+    logging.info(f"Found {len(all_images)} unique images in pairs")
+
+    embeddings_dict = compute_embeddings_for_all_images(
+        all_images, model, args.device, args.batch_size
+    )
+
+    # 5. Porównaj pary na podstawie wcześniej policzonych embeddingów
     os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
 
     with open(args.output_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["img1", "img2", "label_same", "cosine_similarity", "is_same_pred"])
 
-        # Przygotuj listy obrazów do przetworzenia w batchu
-        batch_size = args.batch_size
-        total_pairs = len(pairs)
-        
-        for batch_start in range(0, total_pairs, batch_size):
-            batch_end = min(batch_start + batch_size, total_pairs)
-            batch_pairs = pairs[batch_start:batch_end]
-            
-            # Zbierz wszystkie obrazy z par w tym batchu
-            batch_images = []
-            pair_indices = []  # mapowanie indeksów batch -> indeksy par
-            
-            for idx, (img1, img2, _) in enumerate(batch_pairs):
-                batch_images.extend([img1, img2])
-                pair_indices.append((2*idx, 2*idx + 1))
-            
-            logging.info(f"Processing batch {batch_start//batch_size + 1}, images {batch_start*2+1}-{batch_end*2}")
-            
-            # Przetwórz cały batch
-            embeddings, valid_indices = get_embeddings_batch(batch_images, model, args.device)
-            
-            if len(valid_indices) == 0:
-                logging.warning(f"Skipping batch {batch_start//batch_size + 1} due to processing errors")
-                continue
-            
-            # Porównaj pary w batchu
-            for pair_idx, (img1, img2, label_str) in enumerate(batch_pairs):
-                idx1, idx2 = pair_indices[pair_idx]
-                
-                # Sprawdź czy oba embeddingi są dostępne
-                if idx1 not in valid_indices or idx2 not in valid_indices:
-                    logging.warning(f"Skipping pair due to missing embedding: {img1}, {img2}")
-                    continue
-                
-                # Znajdź właściwe embeddingi z batch results
-                emb1 = embeddings[valid_indices.index(idx1)]
-                emb2 = embeddings[valid_indices.index(idx2)]
-                
-                cos_sim = cosine_similarity(emb1, emb2)
-                pred_same = cos_sim >= args.threshold
-                writer.writerow([img1, img2, label_str, cos_sim, pred_same])
+        skipped = 0
 
-    logging.info(f"Results saved to {args.output_csv}")
+        for img1, img2, label_str in pairs:
+            emb1 = embeddings_dict.get(img1)
+            emb2 = embeddings_dict.get(img2)
+
+            if emb1 is None or emb2 is None:
+                logging.warning(
+                    f"Skipping pair because embedding is missing: {img1}, {img2}"
+                )
+                skipped += 1
+                continue
+
+            cos_sim = cosine_similarity(emb1, emb2)
+            pred_same = cos_sim >= args.threshold
+            writer.writerow([img1, img2, label_str, cos_sim, pred_same])
+
+    logging.info(
+        f"Results saved to {args.output_csv}. "
+        f"Skipped pairs (missing embedding): {skipped}"
+    )
 
 
 if __name__ == "__main__":
     main()
-
-
