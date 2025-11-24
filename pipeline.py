@@ -3,6 +3,7 @@ import argparse
 import csv
 import logging
 import os
+import time  # <- do pomiaru czasu
 
 import torch
 from PIL import Image
@@ -182,11 +183,27 @@ def main():
     model = load_model(args.device, args.weights)
 
     # 4. Wylicz embeddingi dla wszystkich unikalnych obrazów
+    #    i zmierz TYLKO czas generowania embeddingów
     all_images = sorted({img for img1, img2, _ in pairs for img in (img1, img2)})
     logging.info(f"Found {len(all_images)} unique images in pairs")
 
+    # Zsynchronizuj GPU przed startem pomiaru (żeby nie liczyć poprzednich operacji)
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    emb_start = time.perf_counter()
+
     embeddings_dict = compute_embeddings_for_all_images(
         all_images, model, args.device, args.batch_size
+    )
+
+    # Zsynchronizuj GPU po zakończeniu, żeby pomiar był dokładny
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    emb_end = time.perf_counter()
+    logging.info(
+        f"Embedding generation time ({args.device}): {emb_end - emb_start:.4f} s"
     )
 
     # 5. Porównaj pary na podstawie wcześniej policzonych embeddingów
