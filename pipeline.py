@@ -10,12 +10,11 @@ from PIL import Image
 from facenet_pytorch import InceptionResnetV1
 import numpy as np
 from numpy.linalg import norm
+from torch.utils.data import Dataset, DataLoader
 
 import directory_prep  # pomocnicze funkcje pracy z katalogiem
 
-# Globalne akumulatory czasu modelu
-GPU_MODEL_TIME_MS = 0.0   # suma czasów forwardów na GPU (ms)
-CPU_MODEL_TIME_SEC = 0.0  # suma czasów forwardów na CPU (s)
+# (Removed per-batch timing counters: GPU_MODEL_TIME_MS / CPU_MODEL_TIME_SEC)
 
 
 def setup_logger(log_level: str):
@@ -81,8 +80,6 @@ def get_embeddings_batch(image_paths: list, model, device: str):
         - aktualizuje globalny GPU_MODEL_TIME_MS albo CPU_MODEL_TIME_SEC
           o czas forwardu modelu dla tego batcha.
     """
-    global GPU_MODEL_TIME_MS, CPU_MODEL_TIME_SEC
-
     tensors = []
     valid_indices = []
 
@@ -98,65 +95,128 @@ def get_embeddings_batch(image_paths: list, model, device: str):
 
     batch = torch.stack(tensors).to(device)
 
-    # --- pomiar czasu samego forwardu modelu ---
-    if device.startswith("cuda") and torch.cuda.is_available():
-        # GPU: używamy cuda.Event do dokładnego czasu kernelów
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-
-        start_event.record()
-        with torch.no_grad():
-            emb_torch = model(batch)
-        end_event.record()
-
-        # czekamy aż GPU skończy ten batch
-        torch.cuda.synchronize()
-        elapsed_ms = start_event.elapsed_time(end_event)  # ms
-        GPU_MODEL_TIME_MS += float(elapsed_ms)
-
-        emb = emb_torch.cpu().numpy()
-    else:
-        # CPU: mierzymy perf_counter wokół forwardu
-        start_cpu = time.perf_counter()
-        with torch.no_grad():
-            emb = model(batch).cpu().numpy()
-        end_cpu = time.perf_counter()
-        CPU_MODEL_TIME_SEC += float(end_cpu - start_cpu)
+    # Forward pass (no per-batch timing to avoid noisy/summed timings)
+    with torch.no_grad():
+        emb_torch = model(batch)
+    # Move to CPU numpy
+    emb = emb_torch.cpu().numpy()
 
     return emb, valid_indices
 
 
-def compute_embeddings_for_all_images(image_paths: list, model, device: str, batch_size: int):
+def compute_embeddings_for_all_images(image_paths: list, model, device: str, batch_size: int, num_workers: int = 4):
     """
     Zwraca słownik {ścieżka_obrazu: embedding}.
     Obrazy są przetwarzane batchami, ale każdy obraz jest embedowany tylko raz.
     """
-    embeddings_dict = {}
+    # Implement prefetching using DataLoader with multiple workers + pinned memory.
+    class ImageDataset(Dataset):
+        def __init__(self, paths):
+            self.paths = paths
+
+        def __len__(self):
+            return len(self.paths)
+
+        def __getitem__(self, idx):
+            path = self.paths[idx]
+            try:
+                img = Image.open(path).convert("RGB")
+                img = img.resize((160, 160), Image.LANCZOS)
+                arr = np.array(img)
+                tensor = torch.tensor(arr).permute(2, 0, 1).float() / 255.0
+            except Exception as e:
+                logging.warning(f"Failed to load image {path}: {e}")
+                # Return an explicit marker that this index failed
+                return path, None
+            return path, tensor
+
+    # We'll return a compact 2D numpy array (N x D) plus the corresponding list of paths
     total = len(image_paths)
-    logging.info(f"Computing embeddings for {total} unique images...")
+    logging.info(f"Computing embeddings for {total} unique images using DataLoader (prefetch)...")
 
-    for start in range(0, total, batch_size):
-        end = min(start + batch_size, total)
-        batch_paths = image_paths[start:end]
+    dataloader = DataLoader(
+        ImageDataset(image_paths),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
 
-        # używamy już istniejącej funkcji batchującej (z pomiarem czasu modelu)
-        batch_embeddings, valid_indices = get_embeddings_batch(batch_paths, model, device)
+    batch_idx = 0
+    use_cuda = device.startswith("cuda") and torch.cuda.is_available()
 
-        if not valid_indices:
-            logging.warning(f"Skipping batch {start // batch_size + 1} because all images failed")
+    all_valid_paths = []
+    emb_list = []
+    gpu_embs = []
+
+    for batch in dataloader:
+        paths, tensors = batch
+
+        # Normalize handling of tensors/list
+        valid_paths = []
+        valid_tensors = []
+        if isinstance(tensors, torch.Tensor):
+            valid_paths = list(paths)
+            valid_tensors = tensors
+        else:
+            for p, t in zip(paths, tensors):
+                if t is None:
+                    logging.warning(f"Skipping broken image from dataloader: {p}")
+                    continue
+                valid_paths.append(p)
+                valid_tensors.append(t)
+
+        if len(valid_paths) == 0:
+            logging.warning(f"Batch {batch_idx+1}: no valid images, skipping")
+            batch_idx += 1
             continue
 
-        # valid_indices to indeksy w batch_paths, a batch_embeddings jest w tej samej kolejności
-        for out_idx, img_idx in enumerate(valid_indices):
-            img_path = batch_paths[img_idx]
-            embeddings_dict[img_path] = batch_embeddings[out_idx]
+        # Ensure we have a tensor batch on CPU (pinned memory) and move to device non-blocking
+        if not isinstance(valid_tensors, torch.Tensor):
+            batch_cpu = torch.stack(valid_tensors).contiguous()
+        else:
+            batch_cpu = valid_tensors.contiguous()
 
-    logging.info(f"Computed embeddings for {len(embeddings_dict)}/{total} images")
-    return embeddings_dict
+        batch_gpu = batch_cpu.to(device, non_blocking=True)
 
+        if use_cuda:
+            with torch.no_grad():
+                emb_torch = model(batch_gpu)
+            gpu_embs.append(emb_torch.detach())
+            all_valid_paths.extend(valid_paths)
+        else:
+            with torch.no_grad():
+                emb_np = model(batch_cpu).cpu().numpy()
+            # collect embeddings and paths
+            emb_list.append(emb_np)
+            all_valid_paths.extend(valid_paths)
 
-def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.dot(a, b) / (norm(a) * norm(b)))
+        batch_idx += 1
+
+    # After loop: consolidate into one numpy array and return
+    if use_cuda:
+        # ensure GPU work is finished before copying back
+        torch.cuda.synchronize()
+
+        if len(gpu_embs) > 0:
+            emb_all_gpu = torch.cat(gpu_embs, dim=0)
+            emb_all = emb_all_gpu.cpu().numpy()
+            embeddings_array = emb_all
+            paths_list = all_valid_paths
+        else:
+            embeddings_array = np.zeros((0, 512), dtype=np.float32)
+            paths_list = []
+    else:
+        if len(emb_list) > 0:
+            embeddings_array = np.vstack(emb_list)
+            paths_list = all_valid_paths
+        else:
+            embeddings_array = np.zeros((0, 512), dtype=np.float32)
+            paths_list = []
+
+    logging.info(f"Computed embeddings for {len(paths_list)}/{total} images")
+    return embeddings_array, paths_list
 
 
 def parse_args():
@@ -183,6 +243,8 @@ def parse_args():
                         help="Cosine threshold for same/different.")
     parser.add_argument("--batch-size", type=int, default=32,
                         help="Number of images to process in one batch.")
+    parser.add_argument("--num-workers", type=int, default=4,
+                        help="Number of DataLoader worker processes to use for prefetching.")
     return parser.parse_args()
 
 
@@ -191,9 +253,10 @@ def main():
     args = parse_args()
     setup_logger(args.log_level)
 
-    # zerujemy liczniki na start
-    GPU_MODEL_TIME_MS = 0.0
-    CPU_MODEL_TIME_SEC = 0.0
+    # Global pipeline timer: start now to reflect entire run duration
+    overall_start = time.perf_counter()
+
+    # (Removed per-batch timing counters)
 
     # Sprawdzenie/sprostowanie wyboru urządzenia
     if args.device.startswith("cuda"):
@@ -229,8 +292,8 @@ def main():
 
     emb_start = time.perf_counter()
 
-    embeddings_dict = compute_embeddings_for_all_images(
-        all_images, model, args.device, args.batch_size
+    embeddings_array, available_images = compute_embeddings_for_all_images(
+        all_images, model, args.device, args.batch_size, args.num_workers
     )
 
     if args.device.startswith("cuda") and torch.cuda.is_available():
@@ -245,42 +308,50 @@ def main():
     # 5. Porównaj pary na podstawie wcześniej policzonych embeddingów
     os.makedirs(os.path.dirname(args.output_csv), exist_ok=True)
 
+    # available_images is the list of image paths aligned with embeddings_array
+    available_index = {p: i for i, p in enumerate(available_images)}
+
+    # If no embeddings were produced, abort
+    if embeddings_array.shape[0] == 0:
+        logging.error("No embeddings available to compare. Exiting.")
+        return
+
+    # Normalize embeddings to unit vectors and compute full similarity matrix (N x N)
+    norms = np.linalg.norm(embeddings_array, axis=1, keepdims=True)
+    norms[norms == 0] = 1e-12
+    emb_norm = embeddings_array / norms
+    sim_matrix = emb_norm.dot(emb_norm.T)
+
+    skipped = 0
+    total_written = 0
+
     with open(args.output_csv, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["img1", "img2", "label_same", "cosine_similarity", "is_same_pred"])
 
-        skipped = 0
-
         for img1, img2, label_str in pairs:
-            emb1 = embeddings_dict.get(img1)
-            emb2 = embeddings_dict.get(img2)
-
-            if emb1 is None or emb2 is None:
-                logging.warning(
-                    f"Skipping pair because embedding is missing: {img1}, {img2}"
-                )
+            idx1 = available_index.get(img1)
+            idx2 = available_index.get(img2)
+            if idx1 is None or idx2 is None:
+                logging.warning(f"Skipping pair because embedding is missing: {img1}, {img2}")
                 skipped += 1
                 continue
 
-            cos_sim = cosine_similarity(emb1, emb2)
+            cos_sim = float(sim_matrix[idx1, idx2])
             pred_same = cos_sim >= args.threshold
             writer.writerow([img1, img2, label_str, cos_sim, pred_same])
+            total_written += 1
 
-    logging.info(
-        f"Results saved to {args.output_csv}. "
-        f"Skipped pairs (missing embedding): {skipped}"
-    )
+    logging.info(f"Saved comparisons to {args.output_csv}. Total rows written: {total_written}. Skipped pairs: {skipped}")
 
-    # --- PODSUMOWANIE CZASÓW CPU / GPU DLA MODELU ---
+    # Ensure GPU work is finished before taking final pipeline timestamp
     if args.device.startswith("cuda") and torch.cuda.is_available():
-        logging.info(
-            f"GPU model forward time (sum over batches): {GPU_MODEL_TIME_MS:.3f} ms "
-            f"({GPU_MODEL_TIME_MS / 1000.0:.4f} s)"
-        )
-    else:
-        logging.info(
-            f"CPU model forward time (sum over batches): {CPU_MODEL_TIME_SEC:.4f} s"
-        )
+        torch.cuda.synchronize()
+
+    overall_end = time.perf_counter()
+    logging.info(f"Total pipeline wall time: {overall_end - overall_start:.4f} s")
+
+    # (Per-batch GPU/CPU accumulated timing removed)
 
 
 if __name__ == "__main__":

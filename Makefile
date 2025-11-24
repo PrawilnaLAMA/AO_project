@@ -8,4 +8,5 @@ eval:
 	--device cuda \
 	--threshold 0.8 \
 	--batch-size 32 \
-	--log-level INFO
+	--log-level INFO \
+	--num-workers 4
