@@ -3,7 +3,7 @@ import argparse
 import csv
 import logging
 import os
-import time  # <- do pomiaru czasu
+import time  # pomiary czasu
 
 import torch
 from PIL import Image
@@ -12,6 +12,10 @@ import numpy as np
 from numpy.linalg import norm
 
 import directory_prep  # pomocnicze funkcje pracy z katalogiem
+
+# Globalne akumulatory czasu modelu
+GPU_MODEL_TIME_MS = 0.0   # suma czasów forwardów na GPU (ms)
+CPU_MODEL_TIME_SEC = 0.0  # suma czasów forwardów na CPU (s)
 
 
 def setup_logger(log_level: str):
@@ -72,7 +76,13 @@ def get_embeddings_batch(image_paths: list, model, device: str):
         - embeddings: np.ndarray o kształcie [N, D]
         - valid_indices: lista indeksów (w oryginalnej liście image_paths),
           dla których udało się policzyć embedding.
+
+    Dodatkowo:
+        - aktualizuje globalny GPU_MODEL_TIME_MS albo CPU_MODEL_TIME_SEC
+          o czas forwardu modelu dla tego batcha.
     """
+    global GPU_MODEL_TIME_MS, CPU_MODEL_TIME_SEC
+
     tensors = []
     valid_indices = []
 
@@ -88,8 +98,30 @@ def get_embeddings_batch(image_paths: list, model, device: str):
 
     batch = torch.stack(tensors).to(device)
 
-    with torch.no_grad():
-        emb = model(batch).cpu().numpy()
+    # --- pomiar czasu samego forwardu modelu ---
+    if device.startswith("cuda") and torch.cuda.is_available():
+        # GPU: używamy cuda.Event do dokładnego czasu kernelów
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+
+        start_event.record()
+        with torch.no_grad():
+            emb_torch = model(batch)
+        end_event.record()
+
+        # czekamy aż GPU skończy ten batch
+        torch.cuda.synchronize()
+        elapsed_ms = start_event.elapsed_time(end_event)  # ms
+        GPU_MODEL_TIME_MS += float(elapsed_ms)
+
+        emb = emb_torch.cpu().numpy()
+    else:
+        # CPU: mierzymy perf_counter wokół forwardu
+        start_cpu = time.perf_counter()
+        with torch.no_grad():
+            emb = model(batch).cpu().numpy()
+        end_cpu = time.perf_counter()
+        CPU_MODEL_TIME_SEC += float(end_cpu - start_cpu)
 
     return emb, valid_indices
 
@@ -107,7 +139,7 @@ def compute_embeddings_for_all_images(image_paths: list, model, device: str, bat
         end = min(start + batch_size, total)
         batch_paths = image_paths[start:end]
 
-        # używamy już istniejącej funkcji batchującej
+        # używamy już istniejącej funkcji batchującej (z pomiarem czasu modelu)
         batch_embeddings, valid_indices = get_embeddings_batch(batch_paths, model, device)
 
         if not valid_indices:
@@ -155,8 +187,13 @@ def parse_args():
 
 
 def main():
+    global GPU_MODEL_TIME_MS, CPU_MODEL_TIME_SEC
     args = parse_args()
     setup_logger(args.log_level)
+
+    # zerujemy liczniki na start
+    GPU_MODEL_TIME_MS = 0.0
+    CPU_MODEL_TIME_SEC = 0.0
 
     # Sprawdzenie/sprostowanie wyboru urządzenia
     if args.device.startswith("cuda"):
@@ -183,11 +220,10 @@ def main():
     model = load_model(args.device, args.weights)
 
     # 4. Wylicz embeddingi dla wszystkich unikalnych obrazów
-    #    i zmierz TYLKO czas generowania embeddingów
+    #    i zmierz czas całego etapu (CPU + GPU + kopiowanie)
     all_images = sorted({img for img1, img2, _ in pairs for img in (img1, img2)})
     logging.info(f"Found {len(all_images)} unique images in pairs")
 
-    # Zsynchronizuj GPU przed startem pomiaru (żeby nie liczyć poprzednich operacji)
     if args.device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
 
@@ -197,13 +233,13 @@ def main():
         all_images, model, args.device, args.batch_size
     )
 
-    # Zsynchronizuj GPU po zakończeniu, żeby pomiar był dokładny
     if args.device.startswith("cuda") and torch.cuda.is_available():
         torch.cuda.synchronize()
 
     emb_end = time.perf_counter()
+    total_emb_time = emb_end - emb_start
     logging.info(
-        f"Embedding generation time ({args.device}): {emb_end - emb_start:.4f} s"
+        f"Embedding generation total wall time ({args.device}): {total_emb_time:.4f} s"
     )
 
     # 5. Porównaj pary na podstawie wcześniej policzonych embeddingów
@@ -234,6 +270,17 @@ def main():
         f"Results saved to {args.output_csv}. "
         f"Skipped pairs (missing embedding): {skipped}"
     )
+
+    # --- PODSUMOWANIE CZASÓW CPU / GPU DLA MODELU ---
+    if args.device.startswith("cuda") and torch.cuda.is_available():
+        logging.info(
+            f"GPU model forward time (sum over batches): {GPU_MODEL_TIME_MS:.3f} ms "
+            f"({GPU_MODEL_TIME_MS / 1000.0:.4f} s)"
+        )
+    else:
+        logging.info(
+            f"CPU model forward time (sum over batches): {CPU_MODEL_TIME_SEC:.4f} s"
+        )
 
 
 if __name__ == "__main__":
